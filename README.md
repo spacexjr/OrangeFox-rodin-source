@@ -57,9 +57,9 @@ From the OrangeFox 14.1 source root:
 ```bash
 cd /path/to/fox_14.1
 mkdir -p device/xiaomi
-git clone https://github.com/NEESCHAL-3/OrangeFox-rodin-source.git device/xiaomi/rodin
+git clone https://github.com/spacexjr/OrangeFox-rodin-source.git device/xiaomi/rodin
 cd device/xiaomi/rodin
-./build-release.sh
+RODIN_ALLOW_UNPINNED_SOURCE=1 ./build-release.sh
 ```
 
 For the normal in-tree workflow, no `ORANGEFOX_TOP`, `RODIN_TOP_DIR`, manual patching, or manual repacking is required.
