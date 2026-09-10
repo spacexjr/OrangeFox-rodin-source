@@ -1,0 +1,278 @@
+#!/bin/bash
+
+set -e
+
+ramdisk="$1"
+phase="$2"
+terminfo="$ramdisk/system/etc/terminfo"
+
+if [ "$phase" != "--first-call" ]; then
+    exit 0
+fi
+
+# relink_libraries is a phony Make target and may leave an older library in
+# recovery/root after libminuitwrp is rebuilt. Refresh it immediately before
+# OrangeFox packs the recovery fragment.
+product_out="$(dirname "$(dirname "$ramdisk")")"
+minuitwrp_src="$product_out/system/lib64/libminuitwrp.so"
+minuitwrp_dst="$ramdisk/system/lib64/libminuitwrp.so"
+if [ -f "$minuitwrp_src" ]; then
+    echo "-- Refreshing recovery libminuitwrp.so from the current build output"
+    cp -fp "$minuitwrp_src" "$minuitwrp_dst"
+fi
+
+# The system-compatible image preserves the stock platform fragment's
+# first-stage runtime and modules while pruning its duplicate recovery
+# userspace. Recovery therefore only needs modules that are absent from stock
+# or deliberately patched for recovery. modules.load.recovery remains intact
+# and resolves the other modules from the platform fragment at boot.
+if [ -d "$ramdisk/lib/modules" ]; then
+    find "$ramdisk/lib/modules" -maxdepth 1 -type f -name '*.ko' -print0 |
+        while IFS= read -r -d '' module; do
+            case "$(basename "$module")" in
+                focaltech_touch_rodin.ko|goodix_core_rodin.ko|nxp_i2c.ko|p73.ko|scp.ko|si_haptic.ko|xiaomi_touch_rodin.ko)
+                    ;;
+                *)
+                    rm -f "$module"
+                    ;;
+            esac
+        done
+fi
+
+# Keep one CJK-capable UI font. Rewrite every theme font reference before
+# pruning so a missing optional font cannot abort GUI resource loading.
+if [ -d "$ramdisk/twres/fonts" ]; then
+    find "$ramdisk/twres" -type f -name '*.xml' -print0 |
+        xargs -0 sed -Ei 's/filename="[^"]+\.(ttf|otf|ttc)"/filename="MiSans.ttf"/g'
+    find "$ramdisk/twres/fonts" -maxdepth 1 -type f \
+        ! -iname 'MiSans.ttf' \
+        ! -iname '*Noto*.ttf' \
+        ! -iname '*Noto*.otf' \
+        ! -iname '*Noto*.ttc' \
+        -delete
+fi
+
+# Package English only in the final rodin recovery ramdisk.
+if [ -d "$ramdisk/twres/languages" ]; then
+    if [ ! -f "$ramdisk/twres/languages/en.xml" ]; then
+        echo "Missing required English language resource" >&2
+        exit 1
+    fi
+
+    find "$ramdisk/twres/languages" -maxdepth 1 -type f \
+        ! -name en.xml \
+        -delete
+fi
+
+# lpdumpd is a diagnostic daemon, not the lptools implementation used for
+# dynamic-partition operations. Its large snapshot/protobuf dependency chain
+# is omitted while lptools, fastbootd, and update_engine_sideload are retained.
+rm -f \
+    "$ramdisk/system/bin/lpdump" \
+    "$ramdisk/system/bin/lpdumpd" \
+    "$ramdisk/system/etc/init/lpdumpd.rc" \
+    "$ramdisk/system/lib64/liblpdump.so" \
+    "$ramdisk/system/lib64/liblpdump_interface-cpp.so" \
+    "$ramdisk/system/lib64/libprotobuf-cpp-full.so" \
+    "$ramdisk/system/lib64/libsnapshot.so"
+
+# Mini debug sections are not used on-device and are already compressed data,
+# so LZ4 cannot reduce them further.
+objcopy_bin="prebuilts/clang/host/linux-x86/clang-r510928/bin/llvm-objcopy"
+readelf_bin="prebuilts/clang/host/linux-x86/clang-r510928/bin/llvm-readelf"
+if [ ! -x "$objcopy_bin" ] || [ ! -x "$readelf_bin" ]; then
+    echo "missing LLVM ELF tools" >&2
+    exit 1
+fi
+while IFS= read -r -d '' binary; do
+    if file "$binary" | grep -q ELF && \
+            "$readelf_bin" -SW "$binary" 2>/dev/null | grep -q '\.gnu_debugdata'; then
+        "$objcopy_bin" --remove-section=.gnu_debugdata "$binary"
+    fi
+done < <(find "$ramdisk/system" -type f -print0)
+
+# UPX is an OrangeFox-supported size reduction. Limit it to binaries verified
+# during the host-side layout test; first-stage init, linker, adbd, service
+# managers, proprietary security HALs, and terminal binaries stay untouched.
+upx_bin="vendor/recovery/tools/upx"
+if [ ! -x "$upx_bin" ]; then
+    echo "missing UPX: $upx_bin" >&2
+    exit 1
+fi
+upx_binaries=(
+    avbctl awk bc bootctl bu charger create_pl_dev dump_image e2fsck
+    e2fsdroid erase_image exfat-fuse fastbootd fatlabel flash_image fsck.exfat
+    fsck.f2fs fsck.fat fscryptpolicyget grep keystore2 keystore_cli_v2 logcat
+    logd lptools lzma make_f2fs minadbd mke2fs mkexfatfs mkfs.fat nano
+    ozip_decrypt pigz reboot recovery resetprop resize2fs rodin_omapi_bridge
+    sgdisk simg2img sload_f2fs tune2fs twrp update_engine_sideload
+    vendor.xiaomi.hw.touchfeature-service-recovery vold_prepare_subdirs
+    watchdogd ziptool android.hardware.boot@1.2-service
+)
+for name in "${upx_binaries[@]}"; do
+    binary="$ramdisk/system/bin/$name"
+    if [ ! -f "$binary" ]; then
+        echo "missing selected UPX binary: $binary" >&2
+        exit 1
+    fi
+    chmod 0755 "$binary"
+    "$upx_bin" -q --lzma "$binary" >/dev/null
+    "$upx_bin" -q -t "$binary" >/dev/null
+done
+
+# Modern fs_config assigns unknown /sbin files mode 0644. Place the actual
+# terminal tools and helper scripts under /system/bin (which receives 0755)
+# and retain their historical /sbin paths as compatibility symlinks.
+while IFS= read -r -d '' source; do
+    name="$(basename "$source")"
+    target="$ramdisk/system/bin/$name"
+    if [ "$name" = nano ] && [ -f "$target" ]; then
+        rm -f "$source"
+    else
+        rm -f "$target"
+        mv "$source" "$target"
+    fi
+    ln -s "/system/bin/$name" "$source"
+done < <(find "$ramdisk/sbin" -maxdepth 1 -type f -print0)
+
+if [ -d "$terminfo" ]; then
+    keep_dir=$(mktemp -d)
+    trap 'rm -rf "$keep_dir"' EXIT
+
+    for entry in a/ansi l/linux v/vt100 x/xterm x/xterm-256color; do
+        if [ -f "$terminfo/$entry" ]; then
+            mkdir -p "$keep_dir/$(dirname "$entry")"
+            cp -p "$terminfo/$entry" "$keep_dir/$entry"
+        fi
+    done
+
+    rm -rf "$terminfo"
+    mv "$keep_dir" "$terminfo"
+    trap - EXIT
+fi
+
+# Rodin safe ELF slimming pass.
+# Remove only non-runtime symbol/debug sections. Dynamic tables, exported
+# symbols, entry points and executable code must remain unchanged.
+(
+    top="${ANDROID_BUILD_TOP:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+
+    llvm_strip="$(
+        find -L "$top/prebuilts/clang/host/linux-x86" \
+            -type f -name llvm-strip 2>/dev/null |
+        sort -V |
+        tail -n 1
+    )"
+
+    llvm_readelf="$(
+        find -L "$top/prebuilts/clang/host/linux-x86" \
+            -type f -name llvm-readelf 2>/dev/null |
+        sort -V |
+        tail -n 1
+    )"
+
+    if [ -x "$llvm_strip" ] && [ -x "$llvm_readelf" ]; then
+        backup_dir="$(mktemp -d)"
+
+        find \
+            "$ramdisk/system/bin" \
+            "$ramdisk/system/lib64" \
+            "$ramdisk/vendor/bin" \
+            "$ramdisk/vendor/lib64" \
+            -type f -print0 2>/dev/null |
+        while IFS= read -r -d '' file; do
+            relative="${file#"$ramdisk"/}"
+
+            case "$relative" in
+                system/bin/init|\
+                system/bin/linker64|\
+                system/bin/recovery|\
+                system/bin/twrp|\
+                system/bin/adbd|\
+                system/bin/fastbootd|\
+                system/bin/magiskboot)
+                    continue
+                    ;;
+            esac
+
+            "$llvm_readelf" -h "$file" >/dev/null 2>&1 ||
+                continue
+
+            backup="$backup_dir/$(printf '%s' "$relative" | sha256sum | awk '{print $1}')"
+            cp -a "$file" "$backup" || continue
+
+            before="$(
+                {
+                    "$llvm_readelf" -d --wide "$file" 2>/dev/null
+                    "$llvm_readelf" --dyn-syms --wide "$file" 2>/dev/null
+                    "$llvm_readelf" -h "$file" 2>/dev/null |
+                        grep -E \
+                        'Class:|Machine:|Entry point address:'
+                } |
+                sha256sum |
+                awk '{print $1}'
+            )"
+
+            if ! "$llvm_strip" --strip-unneeded "$file" >/dev/null 2>&1; then
+                cp -a "$backup" "$file"
+                continue
+            fi
+
+            after="$(
+                {
+                    "$llvm_readelf" -d --wide "$file" 2>/dev/null
+                    "$llvm_readelf" --dyn-syms --wide "$file" 2>/dev/null
+                    "$llvm_readelf" -h "$file" 2>/dev/null |
+                        grep -E \
+                        'Class:|Machine:|Entry point address:'
+                } |
+                sha256sum |
+                awk '{print $1}'
+            )"
+
+            if [ "$before" != "$after" ]; then
+                cp -a "$backup" "$file"
+            fi
+        done
+
+        rm -rf "$backup_dir"
+
+        echo "-- Rodin safe ELF slimming pass completed"
+    else
+        echo "ERROR: Rodin ELF slimming tools missing" >&2
+        exit 1
+    fi
+)
+
+# OrangeFox's A/B recovery preservation code consumes these manifests at
+# runtime. Generate them only after all rodin pruning, file moves and UPX
+# compression have finished so the file list and hashes match the final
+# recovery ramdisk exactly.
+(
+    cd "$ramdisk"
+
+    rm -f ramdisk-files.txt ramdisk-files.sha256sum
+    : > ramdisk-files.txt
+    : > ramdisk-files.sha256sum
+
+    # Include directories, regular files and symlinks in the cpio input list.
+    # The two manifest files already exist, so they are included as well.
+    find . -print |
+        sed 's#^\./##' \
+        > ramdisk-files.txt
+
+    # Avoid a circular checksum for the checksum manifest itself.
+    # prop.default is intentionally excluded, matching the AOSP build rule.
+    find . -type f \
+        ! -path './ramdisk-files.sha256sum' \
+        ! -path './prop.default' \
+        ! -path './linkerconfig/ld.config.txt' \
+        -print0 |
+        sort -z |
+        xargs -0 sha256sum \
+        > ramdisk-files.sha256sum
+
+    echo "-- Generated OrangeFox runtime ramdisk manifests"
+    echo "   files: $(wc -l < ramdisk-files.txt)"
+    echo "   hashes: $(wc -l < ramdisk-files.sha256sum)"
+)
