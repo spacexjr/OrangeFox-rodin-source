@@ -57,7 +57,7 @@ From the OrangeFox 14.1 source root:
 ```bash
 cd /path/to/fox_14.1
 mkdir -p device/xiaomi
-git clone https://github.com/spacexjr/OrangeFox-rodin-source.git device/xiaomi/rodin
+git clone https://gitlab.com/spacexzr/OrangeFox-rodin-source.git device/xiaomi/rodin
 cd device/xiaomi/rodin
 RODIN_ALLOW_UNPINNED_SOURCE=1 ./build-release.sh
 ```
@@ -77,10 +77,10 @@ Outputs are written to `out/target/product/rodin/`:
 
 ```text
 out/target/product/rodin/
-├── OrangeFox-R12.0-NEESCHAL-rodin-HOS-AVB-ENABLED.img
-├── OrangeFox-R12.0-NEESCHAL-rodin-HOS-AVB-DISABLED.img
-├── OrangeFox-R12.0-NEESCHAL-rodin-AOSP-AVB-ENABLED.img
-├── OrangeFox-R12.0-NEESCHAL-rodin-AOSP-AVB-DISABLED.img
+├── OrangeFox-R12.0-BMO-rodin-HOS-AVB-ENABLED.img
+├── OrangeFox-R12.0-BMO-rodin-HOS-AVB-DISABLED.img
+├── OrangeFox-R12.0-BMO-rodin-AOSP-AVB-ENABLED.img
+├── OrangeFox-R12.0-BMO-rodin-AOSP-AVB-DISABLED.img
 └── RODIN-ORANGEFOX-SHA256SUMS.txt
 ```
 
